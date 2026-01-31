@@ -71,8 +71,7 @@ def health():
     # Ollama check
     try:
         r = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=10)
-        if not r.raise_for_status():
-            raise RuntimeError(r.text)
+        r.raise_for_status()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ollama connection error: {e}")
     
