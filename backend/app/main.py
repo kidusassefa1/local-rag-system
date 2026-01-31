@@ -1,0 +1,146 @@
+from typing import List, Optional
+import requests
+import uuid
+import psycopg2.extras
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+from .config import OLLAMA_BASE_URL
+from .db import conn
+from .ollama import embed
+from .schema import ensure_schema
+
+
+app = FastAPI(title="Local RAG System Backend", version="0.1")
+
+
+def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> List[str]:
+    text = (text or "").strip()
+    if not text:
+        return []
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        j = min(n, i + chunk_size)
+        piece = text[i:j].strip()
+        if piece:
+            out.append(piece)
+        i = j - overlap
+        if i < 0:
+            i = 0
+        if i >= n:
+            break
+    return out
+
+
+class IngestTextRequest(BaseModel):
+    doc_name: str
+    text: str
+
+class IngestResponse(BaseModel):
+    document_id: str
+    chunks_ingested: int
+
+class QueryRequest(BaseModel):
+    query: str
+    top_k: int = 5
+
+class Hit(BaseModel):
+    chunk_id: int
+    doc_name: str
+    chunk_index: Optional[int]
+    content: str
+    score: float
+
+class QueryResponse(BaseModel):
+    query: str
+    hits: List[Hit]
+
+
+@app.get("/health")
+def health():
+    # postgres check
+    try:
+        ensure_schema()
+        with conn() as c:
+            with c.cursor() as cur:
+                cur.execute("SELECT 1;")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database connection error: {e}")
+    
+    # Ollama check
+    try:
+        r = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=10)
+        if not r.raise_for_status():
+            raise RuntimeError(r.text)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ollama connection error: {e}")
+    
+    return {"status": "ok"}
+
+@app.post("/ingest/text", response_model=IngestResponse)
+def ingest_text(req: IngestTextRequest):
+    ensure_schema()
+    chunks = chunk_text(req.text)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="No text to ingest")
+    
+    document_id = str(uuid.uuid4())
+    with conn() as c:
+        with c.cursor() as cur:
+            cur.execute(
+                "INSERT INTO documents (id, name) VALUES (%s, %s);",
+                (document_id, req.doc_name),
+            )
+            
+            for idx, chunk in enumerate(chunks):
+                emb = embed(chunk)
+                cur.execute(
+                    """
+                    INSERT INTO chunks (document_id, chunk_index, content, embedding)
+                    VALUES (%s, %s, %s, %s);
+                    """,
+                    (document_id, idx, chunk, emb),
+                )
+        c.commit()
+
+    return IngestResponse(document_id=document_id, chunks_ingested=len(chunks))
+
+@app.post("/query", response_model=QueryResponse)
+def query(req: QueryRequest):
+    ensure_schema()
+    q_emb = embed(req.query)
+    
+    with conn() as c:
+        with c.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute(
+                """
+                SELECT 
+                    c.id AS chunk_id,
+                    d.name AS doc_name,
+                    c.chunk_index,
+                    c.content,
+                    c.embedding <=> %s::vector) AS distance
+                FROM chunks c
+                JOIN documents d ON c.document_id = d.id
+                ORDER BY c.embedding <=> %s::vector
+                LIMIT %s;
+                """,
+                (q_emb, q_emb, req.top_k))
+            rows = cur.fetchall()
+    
+    hits = []
+    for row in rows:
+        dist = float(row["distance"])
+        score = 1.0 / (1.0 + dist)  # convert distance to score
+        hits.append(
+            Hit(
+                chunk_id=int(row["chunk_id"]),
+                doc_name=str(row["doc_name"]),
+                chunk_index=int(row["chunk_index"]) if row["chunk_index"] is not None else None,
+                content=str(row["content"]),
+                score=score,
+            )
+        )
+
+    return QueryResponse(query=req.query, hits=hits)
