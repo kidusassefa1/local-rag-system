@@ -18,18 +18,25 @@ def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> List[str
     text = (text or "").strip()
     if not text:
         return []
+    overlap = min(overlap, chunk_size - 1)
     out = []
     i, n = 0, len(text)
+
     while i < n:
         j = min(n, i + chunk_size)
         piece = text[i:j].strip()
+
         if piece:
             out.append(piece)
-        i = j - overlap
-        if i < 0:
-            i = 0
-        if i >= n:
+        
+        if j >= n:
             break
+
+        next_i = j - overlap
+        if next_i <= i:
+            next_i = i + 1 
+        i = next_i
+
     return out
 
 
