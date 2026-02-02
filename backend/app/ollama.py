@@ -15,6 +15,6 @@ def embed(text: str) -> List[float]:
 
     r.raise_for_status()
     data = r.json()
-    if "embedding" not in data:
+    if "embeddings" not in data:
         raise ValueError(f"Embedding not found in response: {data}")
-    return data["embedding"]
+    return data["embeddings"]
