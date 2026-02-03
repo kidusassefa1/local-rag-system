@@ -39,6 +39,20 @@ def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> List[str
 
     return out
 
+def to_pgvector_str(emb) -> str:
+    # Flatten if embedding is nested like [[...]]
+    if isinstance(emb, list) and len(emb) > 0 and isinstance(emb[0], list):
+        if len(emb) == 1:
+            emb = emb[0]
+        else:
+            raise ValueError("Embedding is 2D with multiple rows; expected 1D vector.")
+
+    if not isinstance(emb, list) or not emb:
+        raise ValueError("Embedding is empty or not a list.")
+
+    # Convert to pgvector literal string: [0.1,0.2,...]
+    return "[" + ",".join(str(float(x)) for x in emb) + "]"
+
 
 class IngestTextRequest(BaseModel):
     doc_name: str
@@ -94,6 +108,7 @@ def ingest_text(req: IngestTextRequest):
     document_id = str(uuid.uuid4())
     with conn() as c:
         with c.cursor() as cur:
+            vec_str = to_pgvector_str(emb)
             cur.execute(
                 "INSERT INTO documents (id, name) VALUES (%s, %s);",
                 (document_id, req.doc_name),
@@ -106,7 +121,7 @@ def ingest_text(req: IngestTextRequest):
                     INSERT INTO chunks (document_id, chunk_index, content, embedding)
                     VALUES (%s, %s, %s, %s);
                     """,
-                    (document_id, idx, chunk, emb),
+                    (document_id, idx, chunk, vec_str),
                 )
         c.commit()
 
