@@ -108,7 +108,6 @@ def ingest_text(req: IngestTextRequest):
     document_id = str(uuid.uuid4())
     with conn() as c:
         with c.cursor() as cur:
-            vec_str = to_pgvector_str(emb)
             cur.execute(
                 "INSERT INTO documents (id, name) VALUES (%s, %s);",
                 (document_id, req.doc_name),
@@ -116,6 +115,7 @@ def ingest_text(req: IngestTextRequest):
             
             for idx, chunk in enumerate(chunks):
                 emb = embed(chunk)
+                vec_str = to_pgvector_str(emb)
                 cur.execute(
                     """
                     INSERT INTO chunks (document_id, chunk_index, content, embedding)
@@ -141,10 +141,10 @@ def query(req: QueryRequest):
                     d.name AS doc_name,
                     c.chunk_index,
                     c.content,
-                    c.embedding <=> %s::vector) AS distance
+                    (c.embedding <=> %s::vector) AS distance
                 FROM chunks c
                 JOIN documents d ON c.document_id = d.id
-                ORDER BY c.embedding <=> %s::vector
+                ORDER BY (c.embedding <=> %s::vector)
                 LIMIT %s;
                 """,
                 (q_emb, q_emb, req.top_k))
