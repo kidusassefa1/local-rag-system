@@ -131,6 +131,7 @@ def ingest_text(req: IngestTextRequest):
 def query(req: QueryRequest):
     ensure_schema()
     q_emb = embed(req.query)
+    vec_str = to_pgvector_str(q_emb)
     
     with conn() as c:
         with c.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
@@ -147,7 +148,7 @@ def query(req: QueryRequest):
                 ORDER BY (c.embedding <=> %s::vector)
                 LIMIT %s;
                 """,
-                (q_emb, q_emb, req.top_k))
+                (vec_str, vec_str, req.top_k))
             rows = cur.fetchall()
     
     hits = []
