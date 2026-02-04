@@ -5,13 +5,51 @@ import psycopg2.extras
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from .config import OLLAMA_BASE_URL
+from .config import OLLAMA_BASE_URL, CHAT_MODEL
 from .db import conn
 from .ollama import embed
 from .schema import ensure_schema
 
 
 app = FastAPI(title="Local RAG System Backend", version="0.1")
+
+
+class IngestTextRequest(BaseModel):
+    doc_name: str
+    text: str
+
+class IngestResponse(BaseModel):
+    document_id: str
+    chunks_ingested: int
+
+class QueryRequest(BaseModel):
+    query: str
+    top_k: int = 5
+
+class Hit(BaseModel):
+    chunk_id: int
+    doc_name: str
+    chunk_index: Optional[int]
+    content: str
+    score: float
+
+class QueryResponse(BaseModel):
+    query: str
+    hits: List[Hit]
+
+class ChatRequest(BaseModel):
+    question: str
+    top_k: int = 5
+
+class Citation(BaseModel):
+    chunk_id: int
+    doc_name: str
+    chunk_index: Optional[int]
+
+class ChatResponse(BaseModel):
+    question: str
+    answer: str
+    citations: List[Citation]
 
 
 def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> List[str]:
@@ -39,6 +77,7 @@ def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> List[str
 
     return out
 
+
 def to_pgvector_str(emb) -> str:
     # Flatten if embedding is nested like [[...]]
     if isinstance(emb, list) and len(emb) > 0 and isinstance(emb[0], list):
@@ -54,28 +93,11 @@ def to_pgvector_str(emb) -> str:
     return "[" + ",".join(str(float(x)) for x in emb) + "]"
 
 
-class IngestTextRequest(BaseModel):
-    doc_name: str
-    text: str
-
-class IngestResponse(BaseModel):
-    document_id: str
-    chunks_ingested: int
-
-class QueryRequest(BaseModel):
-    query: str
-    top_k: int = 5
-
-class Hit(BaseModel):
-    chunk_id: int
-    doc_name: str
-    chunk_index: Optional[int]
-    content: str
-    score: float
-
-class QueryResponse(BaseModel):
-    query: str
-    hits: List[Hit]
+def build_context(hits: List['Hit']):
+    parts = []
+    for hit in hits:
+        parts.append(f"[{hit.chunk_id}] ({hit.doc_name}#{hit.chunk_index}) {hit.content}\n")
+    return "\n".join(parts)
 
 
 @app.get("/health")
@@ -97,6 +119,7 @@ def health():
         raise HTTPException(status_code=500, detail=f"Ollama connection error: {e}")
     
     return {"status": "ok"}
+
 
 @app.post("/ingest/text", response_model=IngestResponse)
 def ingest_text(req: IngestTextRequest):
@@ -126,6 +149,7 @@ def ingest_text(req: IngestTextRequest):
         c.commit()
 
     return IngestResponse(document_id=document_id, chunks_ingested=len(chunks))
+
 
 @app.post("/query", response_model=QueryResponse)
 def query(req: QueryRequest):
@@ -166,3 +190,42 @@ def query(req: QueryRequest):
         )
 
     return QueryResponse(query=req.query, hits=hits)
+
+
+@app.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest):
+    qr = query(QueryRequest(query=req.question, top_k=req.top_k))
+
+    context = build_context(qr.hits)
+
+    system_msg = (
+        "You are a helpful assistant. Answer using ONLY the provided context. "
+        "If the context does not contain the answer, say you don't know."
+        "When you use a fact, cite it like [chunk_id]."
+    )
+
+
+    payload = {
+        "model": CHAT_MODEL,
+        "messages": [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {req.question}"},
+        ],
+        "stream": False,
+    }
+
+    r = requests.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload, timeout=180)
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=f"Ollama chat error: {r.status_code} {r.text}")
+    
+    answer = r.json().get("message", {}).get("content", "").strip()
+    if not answer:
+        raise HTTPException(status_code=502, detail=f"Unexpected Ollama response: {r.text}")
+    
+    citations = [Citation(
+        chunk_id=hit.chunk_id,
+        doc_name=hit.doc_name,
+        chunk_index=hit.chunk_index,
+    ) for hit in qr.hits]
+
+    return ChatResponse(question=req.question, answer=answer, citations=citations)
